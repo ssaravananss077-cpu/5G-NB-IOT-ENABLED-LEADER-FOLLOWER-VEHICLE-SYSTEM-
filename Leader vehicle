@@ -1,0 +1,270 @@
+/*
+ * ============================================================
+ *  LEADER CAR — ESP32  (Arduino IDE)
+ *  Protocol  : ESP-NOW  (no router needed)
+ *  Motors    : 4x DC via 1x L298N
+ *  Control   : Joystick on A0/A1  OR  Serial commands
+ * ============================================================
+ *
+ *  PIN CONNECTIONS  (Leader)
+ *  ─────────────────────────────────────────────────────────
+ *  L298N          ESP32 GPIO
+ *  IN1       ──►  GPIO 25   (Motor 1 – Front-Left  forward)
+ *  IN2       ──►  GPIO 26   (Motor 1 – Front-Left  reverse)
+ *  IN3       ──►  GPIO 27   (Motor 2 – Front-Right forward)
+ *  IN4       ──►  GPIO 14   (Motor 2 – Front-Right reverse)
+ *  ENA       ──►  GPIO 32   (Motor 1 PWM speed)
+ *  ENB       ──►  GPIO 33   (Motor 2 PWM speed)
+ *  IN1(M3)   ──►  GPIO 16   (Motor 3 – Rear-Left   forward)
+ *  IN2(M3)   ──►  GPIO 17   (Motor 3 – Rear-Left   reverse)
+ *  IN3(M4)   ──►  GPIO 18   (Motor 4 – Rear-Right  forward)
+ *  IN4(M4)   ──►  GPIO 19   (Motor 4 – Rear-Right  reverse)
+ *  ENA(M3)   ──►  GPIO 21   (Motor 3 PWM speed)
+ *  ENB(M4)   ──►  GPIO 22   (Motor 4 PWM speed)
+ *
+ *  Power
+ *  12V battery  ──►  L298N VCC + GND
+ *  L298N 5V out ──►  ESP32 VIN
+ *  All GNDs tied together
+ *
+ *  Optional Joystick (analog)
+ *  VRx  ──►  GPIO 34 (A/D)
+ *  VRy  ──►  GPIO 35 (A/D)
+ *  GND  ──►  GND,  VCC ──► 3.3V
+ * ============================================================
+ *
+ *  HOW TO FIND FOLLOWER MAC ADDRESS:
+ *  1. Upload "get_mac_address" sketch to follower ESP32
+ *  2. Open Serial Monitor → copy the MAC printed
+ *  3. Paste it into FOLLOWER_MAC below
+ * ============================================================
+ */
+
+#include <esp_now.h>
+#include <WiFi.h>
+
+// ── Paste follower ESP32 MAC address here ──────────────────
+uint8_t FOLLOWER_MAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// Example: {0x24, 0x6F, 0x28, 0xAB, 0xCD, 0xEF}
+
+// ── Motor pins ─────────────────────────────────────────────
+// Front-Left  (Motor 1)
+#define M1_IN1  25
+#define M1_IN2  26
+#define M1_ENA  32
+// Front-Right (Motor 2)
+#define M2_IN3  27
+#define M2_IN4  14
+#define M2_ENB  33
+// Rear-Left   (Motor 3)
+#define M3_IN1  16
+#define M3_IN2  17
+#define M3_ENA  21
+// Rear-Right  (Motor 4)
+#define M4_IN3  18
+#define M4_IN4  19
+#define M4_ENB  22
+
+// ── Joystick pins ──────────────────────────────────────────
+#define JOY_X   34
+#define JOY_Y   35
+
+// ── PWM (LEDC) settings ────────────────────────────────────
+#define PWM_FREQ   5000
+#define PWM_BITS   8       // 0–255
+#define CH_M1      0
+#define CH_M2      1
+#define CH_M3      2
+#define CH_M4      3
+
+// ── Data packet sent to follower ───────────────────────────
+typedef struct {
+  int8_t  speed;     // -100 to +100  (negative = reverse)
+  int8_t  turn;      // -100 to +100  (negative = left)
+  uint8_t mode;      // 0=stop 1=forward 2=backward 3=left 4=right
+} CarPacket;
+
+CarPacket packet;
+
+// ── ESP-NOW send callback ───────────────────────────────────
+void onDataSent(const uint8_t *mac, esp_now_send_status_t status) {
+  // Uncomment to debug:
+  // Serial.print("Send status: ");
+  // Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+}
+
+// ── Motor helpers ───────────────────────────────────────────
+void motorWrite(int in1, int in2, int pwmCh, int speed) {
+  // speed: -255 to +255
+  speed = constrain(speed, -255, 255);
+  if (speed > 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+    ledcWrite(pwmCh, speed);
+  } else if (speed < 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+    ledcWrite(pwmCh, -speed);
+  } else {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+    ledcWrite(pwmCh, 0);
+  }
+}
+
+void driveForward(int spd) {
+  motorWrite(M1_IN1, M1_IN2, CH_M1,  spd);
+  motorWrite(M2_IN3, M2_IN4, CH_M2,  spd);
+  motorWrite(M3_IN1, M3_IN2, CH_M3,  spd);
+  motorWrite(M4_IN3, M4_IN4, CH_M4,  spd);
+}
+
+void driveBackward(int spd) {
+  motorWrite(M1_IN1, M1_IN2, CH_M1, -spd);
+  motorWrite(M2_IN3, M2_IN4, CH_M2, -spd);
+  motorWrite(M3_IN1, M3_IN2, CH_M3, -spd);
+  motorWrite(M4_IN3, M4_IN4, CH_M4, -spd);
+}
+
+void turnLeft(int spd) {
+  // Left wheels backward, right wheels forward
+  motorWrite(M1_IN1, M1_IN2, CH_M1, -spd);
+  motorWrite(M2_IN3, M2_IN4, CH_M2,  spd);
+  motorWrite(M3_IN1, M3_IN2, CH_M3, -spd);
+  motorWrite(M4_IN3, M4_IN4, CH_M4,  spd);
+}
+
+void turnRight(int spd) {
+  motorWrite(M1_IN1, M1_IN2, CH_M1,  spd);
+  motorWrite(M2_IN3, M2_IN4, CH_M2, -spd);
+  motorWrite(M3_IN1, M3_IN2, CH_M3,  spd);
+  motorWrite(M4_IN3, M4_IN4, CH_M4, -spd);
+}
+
+void stopAll() {
+  motorWrite(M1_IN1, M1_IN2, CH_M1, 0);
+  motorWrite(M2_IN3, M2_IN4, CH_M2, 0);
+  motorWrite(M3_IN1, M3_IN2, CH_M3, 0);
+  motorWrite(M4_IN3, M4_IN4, CH_M4, 0);
+}
+
+// ── Send packet to follower ─────────────────────────────────
+void sendToFollower() {
+  esp_now_send(FOLLOWER_MAC, (uint8_t *)&packet, sizeof(packet));
+}
+
+// ── Setup ───────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Serial.println("=== LEADER CAR STARTING ===");
+
+  // Motor output pins
+  int outPins[] = {M1_IN1, M1_IN2, M2_IN3, M2_IN4,
+                   M3_IN1, M3_IN2, M4_IN3, M4_IN4};
+  for (int p : outPins) {
+    pinMode(p, OUTPUT);
+    digitalWrite(p, LOW);
+  }
+
+  // LEDC PWM channels
+  ledcSetup(CH_M1, PWM_FREQ, PWM_BITS);  ledcAttachPin(M1_ENA, CH_M1);
+  ledcSetup(CH_M2, PWM_FREQ, PWM_BITS);  ledcAttachPin(M2_ENB, CH_M2);
+  ledcSetup(CH_M3, PWM_FREQ, PWM_BITS);  ledcAttachPin(M3_ENA, CH_M3);
+  ledcSetup(CH_M4, PWM_FREQ, PWM_BITS);  ledcAttachPin(M4_ENB, CH_M4);
+
+  // Joystick
+  pinMode(JOY_X, INPUT);
+  pinMode(JOY_Y, INPUT);
+
+  // Wi-Fi in station mode for ESP-NOW
+  WiFi.mode(WIFI_STA);
+  Serial.print("Leader MAC: "); Serial.println(WiFi.macAddress());
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init FAILED. Check antenna/power.");
+    while (true) delay(1000);
+  }
+  esp_now_register_send_cb(onDataSent);
+
+  // Register follower as peer
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, FOLLOWER_MAC, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add follower peer.");
+  } else {
+    Serial.println("Follower peer registered.");
+  }
+
+  stopAll();
+  Serial.println("Ready. Use Serial: F/B/L/R/S or joystick.");
+}
+
+// ── Loop ────────────────────────────────────────────────────
+void loop() {
+
+  // ── Option A: Serial keyboard control ──────────────────
+  if (Serial.available()) {
+    char cmd = toupper(Serial.read());
+    int  spd = 200;  // 0–255
+
+    switch (cmd) {
+      case 'F':
+        driveForward(spd);
+        packet = {100, 0, 1};
+        Serial.println("FORWARD");
+        break;
+      case 'B':
+        driveBackward(spd);
+        packet = {-100, 0, 2};
+        Serial.println("BACKWARD");
+        break;
+      case 'L':
+        turnLeft(spd);
+        packet = {0, -100, 3};
+        Serial.println("LEFT");
+        break;
+      case 'R':
+        turnRight(spd);
+        packet = {0, 100, 4};
+        Serial.println("RIGHT");
+        break;
+      case 'S':
+      default:
+        stopAll();
+        packet = {0, 0, 0};
+        Serial.println("STOP");
+        break;
+    }
+    sendToFollower();
+  }
+
+  // ── Option B: Joystick control (uncomment to use) ──────
+  /*
+  int rawX = analogRead(JOY_X);  // 0–4095
+  int rawY = analogRead(JOY_Y);
+
+  // Map to -100 to +100
+  int joyX = map(rawX, 0, 4095, -100, 100);
+  int joyY = map(rawY, 0, 4095, -100, 100);
+
+  int deadzone = 15;
+  int spd = 180;
+
+  if (abs(joyY) > deadzone) {
+    if (joyY > 0) driveForward(spd);
+    else           driveBackward(spd);
+    packet = {(int8_t)joyY, (int8_t)joyX, joyY > 0 ? 1 : 2};
+  } else if (abs(joyX) > deadzone) {
+    if (joyX > 0) turnRight(spd);
+    else           turnLeft(spd);
+    packet = {0, (int8_t)joyX, joyX > 0 ? 4 : 3};
+  } else {
+    stopAll();
+    packet = {0, 0, 0};
+  }
+  sendToFollower();
+  delay(50);
+  */
+}
