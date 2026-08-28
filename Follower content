@@ -1,0 +1,256 @@
+/*
+ * ============================================================
+ *  FOLLOWER CAR — ESP32  (Arduino IDE)
+ *  Protocol  : ESP-NOW  (receives from leader)
+ *  Motors    : 4x DC via 1x L298N
+ *  Sensor    : HC-SR04 ultrasonic (obstacle stop)
+ * ============================================================
+ *
+ *  PIN CONNECTIONS  (Follower)
+ *  ─────────────────────────────────────────────────────────
+ *  L298N          ESP32 GPIO
+ *  IN1       ──►  GPIO 25   (Motor 1 – Front-Left  forward)
+ *  IN2       ──►  GPIO 26   (Motor 1 – Front-Left  reverse)
+ *  IN3       ──►  GPIO 27   (Motor 2 – Front-Right forward)
+ *  IN4       ──►  GPIO 14   (Motor 2 – Front-Right reverse)
+ *  ENA       ──►  GPIO 32   (Motor 1 PWM speed)
+ *  ENB       ──►  GPIO 33   (Motor 2 PWM speed)
+ *  IN1(M3)   ──►  GPIO 16   (Motor 3 – Rear-Left   forward)
+ *  IN2(M3)   ──►  GPIO 17   (Motor 3 – Rear-Left   reverse)
+ *  IN3(M4)   ──►  GPIO 18   (Motor 4 – Rear-Right  forward)
+ *  IN4(M4)   ──►  GPIO 19   (Motor 4 – Rear-Right  reverse)
+ *  ENA(M3)   ──►  GPIO 21   (Motor 3 PWM speed)
+ *  ENB(M4)   ──►  GPIO 22   (Motor 4 PWM speed)
+ *
+ *  HC-SR04        ESP32 GPIO
+ *  TRIG      ──►  GPIO 5
+ *  ECHO      ──►  GPIO 4   (use voltage divider: 1kΩ+2kΩ)
+ *  VCC       ──►  5V (from L298N 5V out)
+ *  GND       ──►  GND
+ *
+ *  Power
+ *  12V battery  ──►  L298N VCC + GND
+ *  L298N 5V out ──►  ESP32 VIN
+ *  All GNDs tied together
+ *
+ *  ⚠ VOLTAGE DIVIDER on ECHO pin:
+ *  ECHO ──[ 1kΩ ]──┬── GPIO 4
+ *                  [ 2kΩ ]
+ *                  GND
+ *  (HC-SR04 ECHO is 5V; ESP32 GPIO max is 3.3V)
+ * ============================================================
+ *
+ *  STEP 1: Upload this sketch first → open Serial Monitor
+ *          Copy the MAC address printed → paste into leader
+ * ============================================================
+ */
+
+#include <esp_now.h>
+#include <WiFi.h>
+
+// ── Motor pins ─────────────────────────────────────────────
+#define M1_IN1  25
+#define M1_IN2  26
+#define M1_ENA  32
+#define M2_IN3  27
+#define M2_IN4  14
+#define M2_ENB  33
+#define M3_IN1  16
+#define M3_IN2  17
+#define M3_ENA  21
+#define M4_IN3  18
+#define M4_IN4  19
+#define M4_ENB  22
+
+// ── HC-SR04 pins ───────────────────────────────────────────
+#define TRIG_PIN  5
+#define ECHO_PIN  4
+
+// ── Safety threshold (cm) ──────────────────────────────────
+#define SAFE_DISTANCE_CM   15   // stop if obstacle closer than this
+#define MIN_FOLLOW_CM      20   // minimum gap to leader before braking
+
+// ── PWM (LEDC) settings ────────────────────────────────────
+#define PWM_FREQ   5000
+#define PWM_BITS   8
+#define CH_M1      0
+#define CH_M2      1
+#define CH_M3      2
+#define CH_M4      3
+
+// ── Received packet structure (must match leader) ──────────
+typedef struct {
+  int8_t  speed;
+  int8_t  turn;
+  uint8_t mode;
+} CarPacket;
+
+CarPacket received;
+volatile bool newData = false;
+
+// ── ESP-NOW receive callback ────────────────────────────────
+void onDataReceived(const uint8_t *mac, const uint8_t *data, int len) {
+  if (len == sizeof(CarPacket)) {
+    memcpy(&received, data, sizeof(CarPacket));
+    newData = true;
+  }
+}
+
+// ── Motor helpers ───────────────────────────────────────────
+void motorWrite(int in1, int in2, int pwmCh, int speed) {
+  speed = constrain(speed, -255, 255);
+  if (speed > 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+    ledcWrite(pwmCh, speed);
+  } else if (speed < 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+    ledcWrite(pwmCh, -speed);
+  } else {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+    ledcWrite(pwmCh, 0);
+  }
+}
+
+void driveForward(int spd) {
+  motorWrite(M1_IN1, M1_IN2, CH_M1,  spd);
+  motorWrite(M2_IN3, M2_IN4, CH_M2,  spd);
+  motorWrite(M3_IN1, M3_IN2, CH_M3,  spd);
+  motorWrite(M4_IN3, M4_IN4, CH_M4,  spd);
+}
+
+void driveBackward(int spd) {
+  motorWrite(M1_IN1, M1_IN2, CH_M1, -spd);
+  motorWrite(M2_IN3, M2_IN4, CH_M2, -spd);
+  motorWrite(M3_IN1, M3_IN2, CH_M3, -spd);
+  motorWrite(M4_IN3, M4_IN4, CH_M4, -spd);
+}
+
+void turnLeft(int spd) {
+  motorWrite(M1_IN1, M1_IN2, CH_M1, -spd);
+  motorWrite(M2_IN3, M2_IN4, CH_M2,  spd);
+  motorWrite(M3_IN1, M3_IN2, CH_M3, -spd);
+  motorWrite(M4_IN3, M4_IN4, CH_M4,  spd);
+}
+
+void turnRight(int spd) {
+  motorWrite(M1_IN1, M1_IN2, CH_M1,  spd);
+  motorWrite(M2_IN3, M2_IN4, CH_M2, -spd);
+  motorWrite(M3_IN1, M3_IN2, CH_M3,  spd);
+  motorWrite(M4_IN3, M4_IN4, CH_M4, -spd);
+}
+
+void stopAll() {
+  motorWrite(M1_IN1, M1_IN2, CH_M1, 0);
+  motorWrite(M2_IN3, M2_IN4, CH_M2, 0);
+  motorWrite(M3_IN1, M3_IN2, CH_M3, 0);
+  motorWrite(M4_IN3, M4_IN4, CH_M4, 0);
+}
+
+// ── HC-SR04 distance measurement ───────────────────────────
+float getDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 25000); // 25ms timeout
+  if (duration == 0) return 999.0; // no echo = clear path
+
+  return (duration * 0.0343) / 2.0;
+}
+
+// ── Execute command from leader ─────────────────────────────
+void executeCommand(CarPacket &cmd, float dist) {
+
+  int spd = map(abs(cmd.speed), 0, 100, 0, 200); // scale 0–200
+
+  // Safety override: obstacle too close, block forward motion
+  if (dist < SAFE_DISTANCE_CM && cmd.mode == 1) {
+    Serial.printf("OBSTACLE! %.1fcm — stopping\n", dist);
+    stopAll();
+    return;
+  }
+
+  // Slow down when approaching minimum follow distance
+  if (dist < MIN_FOLLOW_CM && cmd.mode == 1) {
+    spd = spd / 2;
+  }
+
+  switch (cmd.mode) {
+    case 1: driveForward(spd);   break;
+    case 2: driveBackward(spd);  break;
+    case 3: turnLeft(spd);       break;
+    case 4: turnRight(spd);      break;
+    case 0:
+    default: stopAll();          break;
+  }
+}
+
+// ── Setup ───────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Serial.println("=== FOLLOWER CAR STARTING ===");
+
+  // Motor pins
+  int outPins[] = {M1_IN1, M1_IN2, M2_IN3, M2_IN4,
+                   M3_IN1, M3_IN2, M4_IN3, M4_IN4};
+  for (int p : outPins) {
+    pinMode(p, OUTPUT);
+    digitalWrite(p, LOW);
+  }
+
+  // LEDC PWM channels
+  ledcSetup(CH_M1, PWM_FREQ, PWM_BITS);  ledcAttachPin(M1_ENA, CH_M1);
+  ledcSetup(CH_M2, PWM_FREQ, PWM_BITS);  ledcAttachPin(M2_ENB, CH_M2);
+  ledcSetup(CH_M3, PWM_FREQ, PWM_BITS);  ledcAttachPin(M3_ENA, CH_M3);
+  ledcSetup(CH_M4, PWM_FREQ, PWM_BITS);  ledcAttachPin(M4_ENB, CH_M4);
+
+  // Sensor
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // Wi-Fi
+  WiFi.mode(WIFI_STA);
+
+  // ★ Print MAC — copy this into leader's FOLLOWER_MAC array
+  Serial.print("★ FOLLOWER MAC ADDRESS: ");
+  Serial.println(WiFi.macAddress());
+  Serial.println("   Copy the above into FOLLOWER_MAC in leader code!");
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init FAILED.");
+    while (true) delay(1000);
+  }
+  esp_now_register_recv_cb(onDataReceived);
+
+  stopAll();
+  Serial.println("Follower ready — waiting for leader commands...");
+}
+
+// ── Loop ────────────────────────────────────────────────────
+void loop() {
+
+  float dist = getDistanceCM();
+
+  if (newData) {
+    newData = false;
+
+    Serial.printf("CMD mode=%d speed=%d turn=%d  dist=%.1fcm\n",
+                  received.mode, received.speed, received.turn, dist);
+
+    executeCommand(received, dist);
+  }
+
+  // Failsafe: if no command received for 1s, stop
+  static unsigned long lastCmdTime = 0;
+  if (newData) lastCmdTime = millis();
+  if (millis() - lastCmdTime > 1000) {
+    stopAll();
+  }
+
+  delay(20);
+}
